@@ -3042,7 +3042,7 @@ _get_v2ray_api_listen() {
     jq -r '.experimental.v2ray_api.listen // empty' "$CONFIG_FILE" 2>/dev/null
 }
 
-_query_traffic_monitoring() {
+_traffic_show_records() {
     if [ ! -f "$CONFIG_FILE" ]; then
         _error "未找到 sing-box 配置文件。"
         return 1
@@ -3052,109 +3052,51 @@ _query_traffic_monitoring() {
 
     local listen=$(_get_v2ray_api_listen)
     if [ -z "$listen" ]; then
-        _error "当前配置未开启 V2Ray API 监听。请先在【流量监控开关】中开启。"
+        _error "当前配置未开启 V2Ray API 监听。请先在【流量统计】中开启。"
         return 1
     fi
 
-    while true; do
-        clear
-        echo -e "${CYAN}"
-        echo '  ╔═══════════════════════════════════════╗'
-        echo '  ║           流量统计查询               ║'
-        echo '  ╚═══════════════════════════════════════╝'
-        echo -e "${NC}"
-        echo -e "  监听地址: ${YELLOW}${listen}${NC}"
-        echo ""
-        echo -e "  ${GREEN}[1]${NC} 一键输出全部流量表"
-        echo -e "  ${GREEN}[2]${NC} 单项查询"
-        echo -e "  ${YELLOW}[0]${NC} 返回主菜单"
-        echo ""
-        read -p "  请输入选项 [0-2]: " query_choice
+    local targets
+    targets=$(_list_traffic_targets)
+    if [ -z "$targets" ]; then
+        _warn "当前配置里没有可统计的入站/出站/用户。"
+        return 1
+    fi
 
-        local tag stat_base uplink_name downlink_name uplink_value downlink_value
-        case "$query_choice" in
-            1)
-                local targets target_kind target_name target_stat uplink_name downlink_name uplink_bytes downlink_bytes total_bytes
-                targets=$(_list_traffic_targets)
-                if [ -z "$targets" ]; then
-                    _warn "当前配置里没有可统计的入站/出站/用户。"
-                    echo ""
-                    read -n 1 -s -r -p "按任意键返回查询菜单..."
-                    continue
-                fi
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║           流量统计记录               ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo -e "  监听地址: ${YELLOW}${listen}${NC}"
+    echo ""
+    printf '  %-10s %-26s %14s %14s %14s\n' "类型" "名称" "上行" "下行" "合计"
+    printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
 
-                printf '\n%s\n' "  ════════════════ 流量统计表 ════════════════"
-                printf '  %-10s %-26s %14s %14s %14s\n' "类型" "名称" "上行" "下行" "合计"
-                printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
-
-                while IFS=$'\t' read -r target_kind target_name target_stat; do
-                    [ -z "$target_kind" ] && continue
-                    uplink_name="${target_stat}>>>uplink"
-                    downlink_name="${target_stat}>>>downlink"
-                    uplink_bytes=$(_grpcurl_get_stat_value "$listen" "$uplink_name" 2>/dev/null || echo "")
-                    downlink_bytes=$(_grpcurl_get_stat_value "$listen" "$downlink_name" 2>/dev/null || echo "")
-                    [ -z "$uplink_bytes" ] && uplink_bytes=0
-                    [ -z "$downlink_bytes" ] && downlink_bytes=0
-                    total_bytes=$((uplink_bytes + downlink_bytes))
-                    printf '  %-10s %-26s %14s %14s %14s\n' \
-                        "$target_kind" \
-                        "$(printf '%s' "$target_name" | cut -c1-26)" \
-                        "$(_human_bytes "$uplink_bytes")" \
-                        "$(_human_bytes "$downlink_bytes")" \
-                        "$(_human_bytes "$total_bytes")"
-                done <<EOF
+    while IFS=$'\t' read -r target_kind target_name target_stat; do
+        [ -z "$target_kind" ] && continue
+        local uplink_name downlink_name uplink_bytes downlink_bytes total_bytes
+        uplink_name="${target_stat}>>>uplink"
+        downlink_name="${target_stat}>>>downlink"
+        uplink_bytes=$(_grpcurl_get_stat_value "$listen" "$uplink_name" 2>/dev/null || echo "")
+        downlink_bytes=$(_grpcurl_get_stat_value "$listen" "$downlink_name" 2>/dev/null || echo "")
+        [ -z "$uplink_bytes" ] && uplink_bytes=0
+        [ -z "$downlink_bytes" ] && downlink_bytes=0
+        total_bytes=$((uplink_bytes + downlink_bytes))
+        printf '  %-10s %-26s %14s %14s %14s\n' \
+            "$target_kind" \
+            "$(printf '%s' "$target_name" | cut -c1-26)" \
+            "$(_human_bytes "$uplink_bytes")" \
+            "$(_human_bytes "$downlink_bytes")" \
+            "$(_human_bytes "$total_bytes")"
+    done <<EOF
 $targets
 EOF
 
-                printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
-                printf '\n'
-                read -n 1 -s -r -p "按任意键返回查询菜单..."
-                ;;
-            2)
-                read -p "  请输入要查询的 tag 或用户标识: " tag
-                tag=$(echo "$tag" | xargs)
-                [ -z "$tag" ] && _error "输入不能为空。" && continue
-                echo ""
-                printf '%-10s %-26s %14s %14s %14s\n' "类型" "名称" "上行" "下行" "合计"
-                printf '%-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
-                for stat_base in \
-                    "inbound>>>${tag}>>>traffic" \
-                    "outbound>>>${tag}>>>traffic" \
-                    "user>>>${tag}>>>traffic"; do
-                    uplink_name="${stat_base}>>>uplink"
-                    downlink_name="${stat_base}>>>downlink"
-                    uplink_value=$(_grpcurl_get_stat_value "$listen" "$uplink_name" 2>/dev/null || echo "")
-                    downlink_value=$(_grpcurl_get_stat_value "$listen" "$downlink_name" 2>/dev/null || echo "")
-                    if [ -n "$uplink_value" ] || [ -n "$downlink_value" ]; then
-                        local row_type
-                        case "$stat_base" in
-                            inbound*) row_type="inbound" ;;
-                            outbound*) row_type="outbound" ;;
-                            user*) row_type="user" ;;
-                        esac
-                        uplink_value=${uplink_value:-0}
-                        downlink_value=${downlink_value:-0}
-                        printf '  %-10s %-26s %14s %14s %14s\n' \
-                            "$row_type" \
-                            "$tag" \
-                            "$(_human_bytes "$uplink_value")" \
-                            "$(_human_bytes "$downlink_value")" \
-                            "$(_human_bytes "$((uplink_value + downlink_value))")"
-                    fi
-                done
-                printf '%-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
-                echo ""
-                read -n 1 -s -r -p "按任意键返回查询菜单..."
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                _error "无效输入，请重试。"
-                continue
-                ;;
-        esac
-    done
+    printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+    printf '\n'
+    return 0
 }
 
 _toggle_traffic_monitoring() {
@@ -3198,8 +3140,10 @@ _toggle_traffic_monitoring() {
                     )
                 ' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
                     mv "$tmp_file" "$CONFIG_FILE"
+                    _install_grpcurl || true
+                    _traffic_history_schedule_job || true
                     _manage_service "restart"
-                    _success "流量监控已开启，V2Ray API 监听在 127.0.0.1:8080。"
+                    _success "流量统计已开启，V2Ray API 和定时采样已准备就绪。"
                 else
                     _error "开启流量监控失败。"
                     rm -f "$tmp_file"
@@ -3214,8 +3158,9 @@ _toggle_traffic_monitoring() {
                     | if (.experimental | type == "object" and length == 0) then del(.experimental) else . end
                 ' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
                     mv "$tmp_file" "$CONFIG_FILE"
+                    _traffic_history_remove_job || true
                     _manage_service "restart"
-                    _success "流量监控已关闭。"
+                    _success "流量统计已关闭，定时采样也已停止。"
                 else
                     _error "关闭流量监控失败。"
                     rm -f "$tmp_file"
@@ -3330,6 +3275,38 @@ _traffic_history_clear_records() {
     rm -f "$TRAFFIC_HISTORY_FILE" "$TRAFFIC_HISTORY_STATE_FILE" 2>/dev/null || true
     : > "$TRAFFIC_HISTORY_FILE"
     printf '%s\n' '{"version":1,"targets":{}}' > "$TRAFFIC_HISTORY_STATE_FILE"
+}
+
+_traffic_history_show_entries() {
+    [ -s "$TRAFFIC_HISTORY_FILE" ] || { _warn "暂无历史记录。"; return 1; }
+
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║           流量历史记录               ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo ""
+    printf '  %-22s %10s %14s %14s %14s\n' "时间" "条目数" "上行" "下行" "合计"
+    printf '  %-22s %10s %14s %14s %14s\n' "----------------------" "----------" "--------------" "--------------" "--------------"
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local ts record_count total_uplink total_downlink total_bytes
+        ts=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
+        record_count=$(echo "$line" | jq -r '.summary.records // 0' 2>/dev/null)
+        total_uplink=$(echo "$line" | jq -r '.summary.uplink // 0' 2>/dev/null)
+        total_downlink=$(echo "$line" | jq -r '.summary.downlink // 0' 2>/dev/null)
+        total_bytes=$(echo "$line" | jq -r '.summary.total // 0' 2>/dev/null)
+        printf '  %-22s %10s %14s %14s %14s\n' \
+            "$(printf '%s' "$ts" | cut -c1-22)" \
+            "$record_count" \
+            "$(_human_bytes "$total_uplink")" \
+            "$(_human_bytes "$total_downlink")" \
+            "$(_human_bytes "$total_bytes")"
+    done < "$TRAFFIC_HISTORY_FILE"
+
+    printf '  %-22s %10s %14s %14s %14s\n' "----------------------" "----------" "--------------" "--------------" "--------------"
 }
 
 _traffic_history_collect_once() {
@@ -3509,25 +3486,36 @@ _traffic_menu() {
         clear
         echo -e "${CYAN}"
         echo '  ╔═══════════════════════════════════════╗'
-        echo '  ║             流量目录                 ║'
+        echo '  ║             流量统计                 ║'
         echo '  ╚═══════════════════════════════════════╝'
         echo -e "${NC}"
-        echo -e "  流量监控: ${YELLOW}$(_get_traffic_monitor_status)${NC}"
-        echo -e "  历史记录: ${YELLOW}$(_traffic_history_status_text)${NC}"
+        echo -e "  流量统计: ${YELLOW}$(_get_traffic_monitor_status)${NC}"
+        echo -e "  定时任务: ${YELLOW}$(_traffic_history_status_text)${NC}"
         echo ""
-        echo -e "  ${GREEN}[1]${NC} 流量监控开关"
-        echo -e "  ${GREEN}[2]${NC} 流量统计查询"
-        echo -e "  ${GREEN}[3]${NC} 流量历史记录"
-        echo -e "  ${GREEN}[4]${NC} 更新脚本"
+        echo -e "  ${GREEN}[1]${NC} 开启/关闭流量统计"
+        echo -e "  ${GREEN}[2]${NC} 显示记录"
+        echo -e "  ${GREEN}[3]${NC} 历史记录"
+        echo -e "  ${GREEN}[4]${NC} 清空记录"
         echo -e "  ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
         read -p "  请输入选项 [0-4]: " traffic_choice
 
         case "$traffic_choice" in
             1) _toggle_traffic_monitoring ;;
-            2) _query_traffic_monitoring ;;
-            3) _traffic_history_menu ;;
-            4) _update_script ;;
+            2) _traffic_show_records; echo ""; read -n 1 -s -r -p "按任意键继续..." ;;
+            3) _traffic_history_show_entries || true; echo ""; read -n 1 -s -r -p "按任意键继续..." ;;
+            4)
+                echo ""
+                read -p "确认清空所有记录吗? (y/N): " confirm_clear
+                if [ "$confirm_clear" = "y" ] || [ "$confirm_clear" = "Y" ]; then
+                    _traffic_history_clear_records
+                    _success "历史记录已清空。"
+                else
+                    _info "已取消清空。"
+                fi
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
             0) return 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -6325,7 +6313,7 @@ _main_menu() {
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
-        echo -e "    ${GREEN}[19]${NC} 流量目录"
+        echo -e "    ${GREEN}[19]${NC} 流量统计"
         echo ""
         
         # 核心管理
