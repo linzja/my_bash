@@ -3062,6 +3062,27 @@ _get_v2ray_api_listen() {
     jq -r '.experimental.v2ray_api.listen // empty' "$CONFIG_FILE" 2>/dev/null
 }
 
+_singbox_supports_v2ray_api() {
+    if [ ! -f "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1 || [ ! -x "$SINGBOX_BIN" ]; then
+        return 1
+    fi
+
+    local tmp_file out
+    tmp_file=$(mktemp)
+    jq '.experimental = ((.experimental // {}) | .v2ray_api = {"listen":"127.0.0.1:8080","stats":{"enabled":true}})' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null || {
+        rm -f "$tmp_file"
+        return 1
+    }
+
+    out=$("$SINGBOX_BIN" check -c "$tmp_file" 2>&1)
+    rm -f "$tmp_file"
+
+    if echo "$out" | grep -q "v2ray api is not included in this build"; then
+        return 1
+    fi
+    return 0
+}
+
 _traffic_show_records() {
     if [ ! -f "$CONFIG_FILE" ]; then
         _error "未找到 sing-box 配置文件。"
@@ -3146,6 +3167,11 @@ _toggle_traffic_monitoring() {
 
         case "$monitor_choice" in
             1)
+                if ! _singbox_supports_v2ray_api; then
+                    _error "当前 sing-box 二进制不支持 v2ray_api（缺少 with_v2ray_api 编译标签）。"
+                    _warn "请换用带该标签的 sing-box 版本，或先关闭这项流量统计功能。"
+                    break
+                fi
                 local tmp_file
                 tmp_file="$(mktemp)"
                 if jq '
