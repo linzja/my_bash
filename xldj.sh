@@ -1201,7 +1201,10 @@ _alpine_bootstrap_before_init() {
 # 安装命令行呼出入口：执行 xlddg 即可再次打开脚本。
 _install_cli_shortcut() {
     local shortcut="/usr/local/bin/xlddg"
+    local cache_dir="/usr/local/etc/xlddg"
+    local cache_script="${cache_dir}/xldj.sh"
     mkdir -p /usr/local/bin 2>/dev/null || return 1
+    mkdir -p "$cache_dir" 2>/dev/null || return 1
 
     if [ "$SELF_SCRIPT_PATH" = "$shortcut" ]; then
         chmod +x "$shortcut" 2>/dev/null || true
@@ -1209,12 +1212,27 @@ _install_cli_shortcut() {
     fi
 
     if [ -f "$SELF_SCRIPT_PATH" ] && [ -s "$SELF_SCRIPT_PATH" ]; then
-        if ! cmp -s "$SELF_SCRIPT_PATH" "$shortcut" 2>/dev/null; then
-            cp -f "$SELF_SCRIPT_PATH" "$shortcut" || return 1
-        fi
+        cp -f "$SELF_SCRIPT_PATH" "$cache_script" || return 1
+        chmod +x "$cache_script" 2>/dev/null || true
+        cat > "$shortcut" <<EOF
+#!/bin/sh
+set -e
+XLDJ_CACHE="${cache_script}"
+XLDJ_URL="${SCRIPT_UPDATE_URL}"
+if command -v curl >/dev/null 2>&1; then
+    tmp="\$(mktemp)"
+    if curl -fsSL "\$XLDJ_URL" -o "\$tmp" >/dev/null 2>&1 && [ -s "\$tmp" ]; then
+        mv "\$tmp" "\$XLDJ_CACHE"
+        chmod +x "\$XLDJ_CACHE" 2>/dev/null || true
+    else
+        rm -f "\$tmp"
+    fi
+fi
+exec bash "\$XLDJ_CACHE" "\$@"
+EOF
         chmod +x "$shortcut" 2>/dev/null || true
         _success "快捷命令已安装：xlddg"
-        _info "后续可直接在终端输入 xlddg 呼出本脚本菜单。"
+        _info "后续可直接在终端输入 xlddg 呼出本脚本菜单（会优先拉取最新版）。"
         return 0
     fi
 
@@ -2671,6 +2689,8 @@ _uninstall() {
 
     _success "清理完成。脚本已自毁。再见！"
     [ -f "${SELF_SCRIPT_PATH}" ] && rm -f "${SELF_SCRIPT_PATH}"
+    rm -f /usr/local/bin/xlddg /usr/local/etc/xlddg/xldj.sh 2>/dev/null || true
+    rmdir /usr/local/etc/xlddg 2>/dev/null || true
     exit 0
 }
 
