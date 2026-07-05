@@ -89,8 +89,8 @@ export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main}"
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/shini74744/Shliixg/refs/heads/main/xldj.sh}"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/linzja/my_bash/main}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/linzja/my_bash/main/xldj.sh}"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -1225,6 +1225,9 @@ _install_cli_shortcut() {
 # 按需补 cron，避免安装阶段无脑安装 dcron 导致 Alpine 小鸡卡住。
 _ensure_cron_available() {
     if command -v crontab >/dev/null 2>&1; then
+        if [ "$INIT_SYSTEM" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
+        fi
         return 0
     fi
 
@@ -1234,6 +1237,8 @@ _ensure_cron_available() {
     if command -v apk >/dev/null 2>&1 && command -v crond >/dev/null 2>&1; then
         _with_timeout 15 rc-service dcron start 2>/dev/null || true
         _with_timeout 15 rc-update add dcron default 2>/dev/null || true
+    elif [ "$INIT_SYSTEM" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
     fi
 
     command -v crontab >/dev/null 2>&1
@@ -1242,11 +1247,16 @@ _ensure_cron_available() {
 # --- 核心变量定义 ---
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
+export GRPCURL_BIN="/usr/local/bin/grpcurl"
 export YQ_BINARY="/usr/local/bin/yq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
 export CLASH_YAML_FILE="${SINGBOX_DIR}/clash.yaml"
 export METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 export ARGO_METADATA_FILE="${SINGBOX_DIR}/argo_metadata.json"
+export TRAFFIC_HISTORY_DIR="${SINGBOX_DIR}/traffic-history"
+export TRAFFIC_HISTORY_FILE="${TRAFFIC_HISTORY_DIR}/traffic-history.jsonl"
+export TRAFFIC_HISTORY_STATE_FILE="${TRAFFIC_HISTORY_DIR}/traffic-history-state.json"
+export TRAFFIC_HISTORY_CRON_MARKER="# xldj-traffic-history"
 export LOG_FILE="/var/log/sing-box.log"
 export PID_FILE="/tmp/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
@@ -2901,6 +2911,627 @@ _check_and_fix_dns() {
         return 0
     fi
     return 1
+}
+
+_get_traffic_monitor_status() {
+    if [ ! -f "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
+        echo "未配置"
+        return 0
+    fi
+
+    if jq -e '.experimental.v2ray_api.stats.enabled == true' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo "已开启"
+    else
+        echo "已关闭"
+    fi
+}
+
+_install_grpcurl() {
+    if [ -x "$GRPCURL_BIN" ]; then
+        return 0
+    fi
+
+    _info "正在安装 grpcurl..."
+    command -v tar >/dev/null 2>&1 || _pkg_install tar || return 1
+
+    local api_url="https://api.github.com/repos/fullstorydev/grpcurl/releases/latest"
+    local release_info=$(_with_timeout_label "$SB_DOWNLOAD_TIMEOUT" "获取 grpcurl 最新版本信息" curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null || true)
+    local version asset_name download_url tmp_dir archive_path extracted_bin arch os_name
+    version=$(echo "$release_info" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+    [ -z "$version" ] && _error "无法获取 grpcurl 版本号。" && return 1
+
+    os_name="linux"
+    case "$(uname -m 2>/dev/null || echo x86_64)" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l|armv7*) arch="armv7" ;;
+        *) arch="x86_64" ;;
+    esac
+
+    asset_name="grpcurl_${version}_${os_name}_${arch}.tar.gz"
+    download_url=$(echo "$release_info" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' 2>/dev/null | head -n1)
+    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        _error "未找到 grpcurl 发行包: ${asset_name}"
+        return 1
+    fi
+
+    tmp_dir=$(mktemp -d)
+    archive_path="${tmp_dir}/grpcurl.tar.gz"
+    if ! _download_file "$download_url" "$archive_path" "grpcurl 安装包" "$SB_DOWNLOAD_TIMEOUT"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    tar -xzf "$archive_path" -C "$tmp_dir" >/dev/null 2>&1 || {
+        _error "grpcurl 解压失败。"
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    extracted_bin=$(find "$tmp_dir" -maxdepth 1 -type f -name grpcurl 2>/dev/null | head -n1)
+    if [ -z "$extracted_bin" ] || [ ! -f "$extracted_bin" ]; then
+        _error "grpcurl 解压后未找到可执行文件。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    install -m 755 "$extracted_bin" "$GRPCURL_BIN" 2>/dev/null || {
+        cp -f "$extracted_bin" "$GRPCURL_BIN" && chmod +x "$GRPCURL_BIN"
+    } || {
+        _error "grpcurl 安装失败。"
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    rm -rf "$tmp_dir"
+    _success "grpcurl 安装成功: ${GRPCURL_BIN}"
+}
+
+_human_bytes() {
+    local bytes="${1:-0}"
+    local awk_bytes
+    awk_bytes=$(echo "$bytes" | awk 'BEGIN{n=0} {n=$1+0; split("B KB MB GB TB PB", u, " "); i=1; while (n>=1024 && i<6) {n/=1024; i++} printf "%.2f %s", n, u[i]}')
+    echo "$awk_bytes"
+}
+
+_grpcurl_get_stat_value() {
+    local listen="$1"
+    local stat_name="$2"
+    local grpc_services=(
+        "stats.command.StatsService"
+        "v2ray.core.app.stats.command.StatsService"
+        "v2ray.app.stats.command.StatsService"
+    )
+    local grpc_service grpc_method grpc_result
+
+    for grpc_service in "${grpc_services[@]}"; do
+        grpc_method="${grpc_service}/GetStats"
+        grpc_result=$(grpcurl -plaintext -format json -d "{\"name\":\"${stat_name}\",\"reset\":false}" "$listen" "$grpc_method" 2>/dev/null || true)
+        if [ -n "$grpc_result" ]; then
+            echo "$grpc_result" | jq -r '.stat.value // empty' 2>/dev/null
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+_list_traffic_targets() {
+    if [ ! -f "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
+        return 1
+    fi
+
+    jq -r '
+        def clean: tostring | gsub("\t"; " ") | gsub("\n"; " ");
+        [
+          (.inbounds[]? | select(.tag? and .tag != "") | ["inbound", .tag, "inbound>>>" + .tag + ">>>traffic"]),
+          (.outbounds[]? | select(.tag? and .tag != "") | ["outbound", .tag, "outbound>>>" + .tag + ">>>traffic"]),
+          (.inbounds[]?.users[]? |
+            if .uuid? and .uuid != "" then ["user", .uuid, "user>>>" + .uuid + ">>>traffic"]
+            elif .username? and .username != "" then ["user", .username, "user>>>" + .username + ">>>traffic"]
+            elif .password? and .password != "" then ["user", .password, "user>>>" + .password + ">>>traffic"]
+            else empty end)
+        ] | flatten(1) | @tsv
+    ' "$CONFIG_FILE" 2>/dev/null | awk -F '\t' '!seen[$1 FS $2 FS $3]++'
+}
+
+_get_v2ray_api_listen() {
+    if [ ! -f "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
+        return 1
+    fi
+    jq -r '.experimental.v2ray_api.listen // empty' "$CONFIG_FILE" 2>/dev/null
+}
+
+_query_traffic_monitoring() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        _error "未找到 sing-box 配置文件。"
+        return 1
+    fi
+
+    _install_grpcurl || return 1
+
+    local listen=$(_get_v2ray_api_listen)
+    if [ -z "$listen" ]; then
+        _error "当前配置未开启 V2Ray API 监听。请先在【流量监控开关】中开启。"
+        return 1
+    fi
+
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║           流量统计查询               ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo -e "  监听地址: ${YELLOW}${listen}${NC}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} 一键输出全部流量表"
+        echo -e "  ${GREEN}[2]${NC} 单项查询"
+        echo -e "  ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        read -p "  请输入选项 [0-2]: " query_choice
+
+        local tag stat_base uplink_name downlink_name uplink_value downlink_value
+        case "$query_choice" in
+            1)
+                local targets target_kind target_name target_stat uplink_name downlink_name uplink_bytes downlink_bytes total_bytes
+                targets=$(_list_traffic_targets)
+                if [ -z "$targets" ]; then
+                    _warn "当前配置里没有可统计的入站/出站/用户。"
+                    echo ""
+                    read -n 1 -s -r -p "按任意键返回查询菜单..."
+                    continue
+                fi
+
+                printf '\n%s\n' "  ════════════════ 流量统计表 ════════════════"
+                printf '  %-10s %-26s %14s %14s %14s\n' "类型" "名称" "上行" "下行" "合计"
+                printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+
+                while IFS=$'\t' read -r target_kind target_name target_stat; do
+                    [ -z "$target_kind" ] && continue
+                    uplink_name="${target_stat}>>>uplink"
+                    downlink_name="${target_stat}>>>downlink"
+                    uplink_bytes=$(_grpcurl_get_stat_value "$listen" "$uplink_name" 2>/dev/null || echo "")
+                    downlink_bytes=$(_grpcurl_get_stat_value "$listen" "$downlink_name" 2>/dev/null || echo "")
+                    [ -z "$uplink_bytes" ] && uplink_bytes=0
+                    [ -z "$downlink_bytes" ] && downlink_bytes=0
+                    total_bytes=$((uplink_bytes + downlink_bytes))
+                    printf '  %-10s %-26s %14s %14s %14s\n' \
+                        "$target_kind" \
+                        "$(printf '%s' "$target_name" | cut -c1-26)" \
+                        "$(_human_bytes "$uplink_bytes")" \
+                        "$(_human_bytes "$downlink_bytes")" \
+                        "$(_human_bytes "$total_bytes")"
+                done <<EOF
+$targets
+EOF
+
+                printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+                printf '\n'
+                read -n 1 -s -r -p "按任意键返回查询菜单..."
+                ;;
+            2)
+                read -p "  请输入要查询的 tag 或用户标识: " tag
+                tag=$(echo "$tag" | xargs)
+                [ -z "$tag" ] && _error "输入不能为空。" && continue
+                echo ""
+                printf '%-10s %-26s %14s %14s %14s\n' "类型" "名称" "上行" "下行" "合计"
+                printf '%-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+                for stat_base in \
+                    "inbound>>>${tag}>>>traffic" \
+                    "outbound>>>${tag}>>>traffic" \
+                    "user>>>${tag}>>>traffic"; do
+                    uplink_name="${stat_base}>>>uplink"
+                    downlink_name="${stat_base}>>>downlink"
+                    uplink_value=$(_grpcurl_get_stat_value "$listen" "$uplink_name" 2>/dev/null || echo "")
+                    downlink_value=$(_grpcurl_get_stat_value "$listen" "$downlink_name" 2>/dev/null || echo "")
+                    if [ -n "$uplink_value" ] || [ -n "$downlink_value" ]; then
+                        local row_type
+                        case "$stat_base" in
+                            inbound*) row_type="inbound" ;;
+                            outbound*) row_type="outbound" ;;
+                            user*) row_type="user" ;;
+                        esac
+                        uplink_value=${uplink_value:-0}
+                        downlink_value=${downlink_value:-0}
+                        printf '  %-10s %-26s %14s %14s %14s\n' \
+                            "$row_type" \
+                            "$tag" \
+                            "$(_human_bytes "$uplink_value")" \
+                            "$(_human_bytes "$downlink_value")" \
+                            "$(_human_bytes "$((uplink_value + downlink_value))")"
+                    fi
+                done
+                printf '%-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+                echo ""
+                read -n 1 -s -r -p "按任意键返回查询菜单..."
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                _error "无效输入，请重试。"
+                continue
+                ;;
+        esac
+    done
+}
+
+_toggle_traffic_monitoring() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        _error "未找到 sing-box 配置文件，无法操作流量监控。"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        _error "缺少 jq，无法修改配置。"
+        return 1
+    fi
+
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║           流量监控开关               ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo -e "  当前状态: ${YELLOW}$(_get_traffic_monitor_status)${NC}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} 开启流量监控"
+        echo -e "  ${GREEN}[2]${NC} 关闭流量监控"
+        echo -e "  ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        read -p "  请输入选项 [0-2]: " monitor_choice
+
+        case "$monitor_choice" in
+            1)
+                local tmp_file
+                tmp_file="$(mktemp)"
+                if jq '
+                    .experimental = (
+                        (.experimental // {})
+                        | .v2ray_api = {
+                            "listen": "127.0.0.1:8080",
+                            "stats": {
+                                "enabled": true
+                            }
+                        }
+                    )
+                ' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
+                    mv "$tmp_file" "$CONFIG_FILE"
+                    _manage_service "restart"
+                    _success "流量监控已开启，V2Ray API 监听在 127.0.0.1:8080。"
+                else
+                    _error "开启流量监控失败。"
+                    rm -f "$tmp_file"
+                fi
+                break
+                ;;
+            2)
+                local tmp_file
+                tmp_file="$(mktemp)"
+                if jq '
+                    del(.experimental.v2ray_api)
+                    | if (.experimental | type == "object" and length == 0) then del(.experimental) else . end
+                ' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
+                    mv "$tmp_file" "$CONFIG_FILE"
+                    _manage_service "restart"
+                    _success "流量监控已关闭。"
+                else
+                    _error "关闭流量监控失败。"
+                    rm -f "$tmp_file"
+                fi
+                break
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                _error "无效输入，请重试。"
+                ;;
+        esac
+    done
+}
+
+_traffic_history_ensure_storage() {
+    mkdir -p "$TRAFFIC_HISTORY_DIR" 2>/dev/null || return 1
+    [ -s "$TRAFFIC_HISTORY_STATE_FILE" ] || printf '%s\n' '{"version":1,"targets":{}}' > "$TRAFFIC_HISTORY_STATE_FILE"
+    [ -f "$TRAFFIC_HISTORY_FILE" ] || : > "$TRAFFIC_HISTORY_FILE"
+}
+
+_traffic_history_is_enabled() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -Fq "$TRAFFIC_HISTORY_CRON_MARKER"
+}
+
+_traffic_history_status_text() {
+    if _traffic_history_is_enabled; then
+        echo "已开启"
+    else
+        echo "已关闭"
+    fi
+}
+
+_traffic_history_schedule_job() {
+    _ensure_cron_available || return 1
+    _install_cli_shortcut || return 1
+    _traffic_history_ensure_storage || return 1
+
+    local cron_line="*/5 * * * * /usr/local/bin/xlddg traffic-history-collect >/dev/null 2>&1 ${TRAFFIC_HISTORY_CRON_MARKER}"
+    if crontab -l 2>/dev/null | grep -Fq "$TRAFFIC_HISTORY_CRON_MARKER"; then
+        crontab -l 2>/dev/null | grep -Fv "$TRAFFIC_HISTORY_CRON_MARKER" | crontab -
+    fi
+    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
+}
+
+_traffic_history_remove_job() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    if crontab -l 2>/dev/null | grep -Fq "$TRAFFIC_HISTORY_CRON_MARKER"; then
+        crontab -l 2>/dev/null | grep -Fv "$TRAFFIC_HISTORY_CRON_MARKER" | crontab -
+    fi
+}
+
+_traffic_history_read_state() {
+    local key="$1"
+    local field="$2"
+    [ -s "$TRAFFIC_HISTORY_STATE_FILE" ] || { echo 0; return 0; }
+    jq -r --arg key "$key" --arg field "$field" '.targets[$key][$field] // 0' "$TRAFFIC_HISTORY_STATE_FILE" 2>/dev/null || echo 0
+}
+
+_traffic_history_show_latest_snapshot() {
+    [ -s "$TRAFFIC_HISTORY_FILE" ] || { _warn "暂无历史记录。"; return 1; }
+
+    local latest
+    latest=$(tail -n 1 "$TRAFFIC_HISTORY_FILE" 2>/dev/null || true)
+    [ -n "$latest" ] || { _warn "暂无可读取的历史记录。"; return 1; }
+
+    local ts listen total_records
+    ts=$(echo "$latest" | jq -r '.timestamp // empty' 2>/dev/null)
+    listen=$(echo "$latest" | jq -r '.listen // empty' 2>/dev/null)
+    total_records=$(echo "$latest" | jq -r '.summary.records // 0' 2>/dev/null)
+
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║           最近历史汇总               ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo "  时间: ${YELLOW}${ts}${NC}"
+    echo "  监听: ${YELLOW}${listen}${NC}"
+    echo "  记录数: ${YELLOW}${total_records}${NC}"
+    echo ""
+    printf '  %-10s %-26s %14s %14s %14s\n' "类型" "名称" "上行" "下行" "合计"
+    printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+    echo "$latest" | jq -r '.records[]? | [.kind, .name, (.cumulative_uplink|tostring), (.cumulative_downlink|tostring), (.cumulative_total|tostring)] | @tsv' 2>/dev/null | \
+        while IFS=$'\t' read -r kind name uplink downlink total; do
+            [ -z "$kind" ] && continue
+            printf '  %-10s %-26s %14s %14s %14s\n' \
+                "$kind" \
+                "$(printf '%s' "$name" | cut -c1-26)" \
+                "$(_human_bytes "${uplink:-0}")" \
+                "$(_human_bytes "${downlink:-0}")" \
+                "$(_human_bytes "${total:-0}")"
+        done
+    printf '  %-10s %-26s %14s %14s %14s\n' "----------" "--------------------------" "--------------" "--------------" "--------------"
+}
+
+_traffic_history_export_recent() {
+    [ -s "$TRAFFIC_HISTORY_FILE" ] || { _warn "暂无历史记录可导出。"; return 1; }
+
+    local export_file="/tmp/sing-box-traffic-history-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo 0).jsonl"
+    tail -n 20 "$TRAFFIC_HISTORY_FILE" > "$export_file" 2>/dev/null || return 1
+    _success "最近 20 条历史记录已导出到: ${export_file}"
+}
+
+_traffic_history_clear_records() {
+    if [ ! -d "$TRAFFIC_HISTORY_DIR" ]; then
+        return 0
+    fi
+
+    rm -f "$TRAFFIC_HISTORY_FILE" "$TRAFFIC_HISTORY_STATE_FILE" 2>/dev/null || true
+    : > "$TRAFFIC_HISTORY_FILE"
+    printf '%s\n' '{"version":1,"targets":{}}' > "$TRAFFIC_HISTORY_STATE_FILE"
+}
+
+_traffic_history_collect_once() {
+    local lock_dir="/tmp/xldj-traffic-history.lock"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        return 0
+    fi
+    trap 'rmdir "$lock_dir" 2>/dev/null || true' RETURN
+
+    _traffic_history_ensure_storage || return 1
+    _install_grpcurl || return 1
+
+    local listen timestamp targets
+    listen=$(_get_v2ray_api_listen)
+    [ -z "$listen" ] && return 0
+
+    targets=$(_list_traffic_targets)
+    [ -z "$targets" ] && return 0
+
+    timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    local state_tmp sample_records_json total_uplink total_downlink total_total sample_count
+    state_tmp=$(mktemp)
+    trap "rm -f '$state_tmp' '${state_tmp}.new' 2>/dev/null || true; rmdir '$lock_dir' 2>/dev/null || true" RETURN
+    cp -f "$TRAFFIC_HISTORY_STATE_FILE" "$state_tmp" 2>/dev/null || printf '%s\n' '{"version":1,"targets":{}}' > "$state_tmp"
+    sample_records_json='[]'
+    total_uplink=0
+    total_downlink=0
+    total_total=0
+    sample_count=0
+
+    while IFS=$'\t' read -r kind name stat_base; do
+        [ -z "$kind" ] && continue
+
+        local uplink downlink old_ul_last old_dl_last old_ul_offset old_dl_offset new_ul_offset new_dl_offset cumulative_uplink cumulative_downlink cumulative_total record
+        uplink=$(_grpcurl_get_stat_value "$listen" "${stat_base}>>>uplink" 2>/dev/null || true)
+        downlink=$(_grpcurl_get_stat_value "$listen" "${stat_base}>>>downlink" 2>/dev/null || true)
+        [ -z "$uplink" ] || [ -z "$downlink" ] && continue
+
+        old_ul_last=$(jq -r --arg key "$stat_base" '.targets[$key].uplink_last // 0' "$state_tmp" 2>/dev/null || echo 0)
+        old_dl_last=$(jq -r --arg key "$stat_base" '.targets[$key].downlink_last // 0' "$state_tmp" 2>/dev/null || echo 0)
+        old_ul_offset=$(jq -r --arg key "$stat_base" '.targets[$key].uplink_offset // 0' "$state_tmp" 2>/dev/null || echo 0)
+        old_dl_offset=$(jq -r --arg key "$stat_base" '.targets[$key].downlink_offset // 0' "$state_tmp" 2>/dev/null || echo 0)
+
+        [ "$uplink" -lt "$old_ul_last" ] && new_ul_offset=$((old_ul_offset + old_ul_last)) || new_ul_offset=$old_ul_offset
+        [ "$downlink" -lt "$old_dl_last" ] && new_dl_offset=$((old_dl_offset + old_dl_last)) || new_dl_offset=$old_dl_offset
+
+        cumulative_uplink=$((new_ul_offset + uplink))
+        cumulative_downlink=$((new_dl_offset + downlink))
+        cumulative_total=$((cumulative_uplink + cumulative_downlink))
+
+        record=$(jq -n \
+            --arg kind "$kind" \
+            --arg name "$name" \
+            --arg stat_base "$stat_base" \
+            --argjson uplink "$uplink" \
+            --argjson downlink "$downlink" \
+            --argjson cumulative_uplink "$cumulative_uplink" \
+            --argjson cumulative_downlink "$cumulative_downlink" \
+            --argjson cumulative_total "$cumulative_total" \
+            '{kind:$kind,name:$name,stat_base:$stat_base,uplink:$uplink,downlink:$downlink,total:($uplink+$downlink),cumulative_uplink:$cumulative_uplink,cumulative_downlink:$cumulative_downlink,cumulative_total:$cumulative_total}')
+        sample_records_json=$(jq --argjson rec "$record" '. + [$rec]' <<<"$sample_records_json")
+
+        total_uplink=$((total_uplink + uplink))
+        total_downlink=$((total_downlink + downlink))
+        total_total=$((total_total + uplink + downlink))
+        sample_count=$((sample_count + 1))
+
+        jq \
+            --arg key "$stat_base" \
+            --arg kind "$kind" \
+            --arg name "$name" \
+            --arg ts "$timestamp" \
+            --argjson uplink "$uplink" \
+            --argjson downlink "$downlink" \
+            --argjson uplink_offset "$new_ul_offset" \
+            --argjson downlink_offset "$new_dl_offset" \
+            '.targets[$key] = {kind:$kind,name:$name,uplink_last:$uplink,downlink_last:$downlink,uplink_offset:$uplink_offset,downlink_offset:$downlink_offset,updated_at:$ts}' \
+            "$state_tmp" > "${state_tmp}.new" && mv "${state_tmp}.new" "$state_tmp" || return 1
+    done <<EOF
+$targets
+EOF
+
+    [ "$sample_count" -eq 0 ] && { rm -f "$state_tmp"; return 0; }
+
+    local sample_json
+    sample_json=$(jq -n \
+        --arg ts "$timestamp" \
+        --arg listen "$listen" \
+        --argjson records "$sample_records_json" \
+        --argjson record_count "$sample_count" \
+        --argjson total_uplink "$total_uplink" \
+        --argjson total_downlink "$total_downlink" \
+        --argjson total_total "$total_total" \
+        '{timestamp:$ts,listen:$listen,records:$records,summary:{records:$record_count,uplink:$total_uplink,downlink:$total_downlink,total:$total_total}}')
+
+    printf '%s\n' "$sample_json" >> "$TRAFFIC_HISTORY_FILE"
+    mv "$state_tmp" "$TRAFFIC_HISTORY_STATE_FILE"
+    return 0
+}
+
+_traffic_history_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║           流量历史记录               ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo -e "  状态: ${YELLOW}$(_traffic_history_status_text)${NC}"
+        [ -s "$TRAFFIC_HISTORY_FILE" ] && echo -e "  文件: ${YELLOW}${TRAFFIC_HISTORY_FILE}${NC}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} 开启定时保存"
+        echo -e "  ${GREEN}[2]${NC} 关闭定时保存"
+        echo -e "  ${GREEN}[3]${NC} 立即采样一次"
+        echo -e "  ${GREEN}[4]${NC} 清空记录"
+        echo -e "  ${GREEN}[5]${NC} 查看最近汇总"
+        echo -e "  ${GREEN}[6]${NC} 导出最近记录"
+        echo -e "  ${YELLOW}[0]${NC} 返回上级菜单"
+        echo ""
+        read -p "  请输入选项 [0-6]: " history_choice
+
+        case "$history_choice" in
+            1)
+                if _traffic_history_schedule_job; then
+                    _success "流量历史定时保存已开启，每 5 分钟采样一次。"
+                else
+                    _error "开启流量历史定时保存失败。"
+                fi
+                ;;
+            2)
+                _traffic_history_remove_job
+                _success "流量历史定时保存已关闭。历史文件保留在原路径。"
+                ;;
+            3)
+                if _traffic_history_collect_once; then
+                    _success "已完成一次手动采样。"
+                else
+                    _error "手动采样失败。"
+                fi
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            4)
+                echo ""
+                read -p "确认清空所有历史记录吗? (y/N): " confirm_clear
+                if [ "$confirm_clear" = "y" ] || [ "$confirm_clear" = "Y" ]; then
+                    _traffic_history_clear_records
+                    _success "历史记录已清空。"
+                else
+                    _info "已取消清空。"
+                fi
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            5)
+                _traffic_history_show_latest_snapshot || true
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            6)
+                _traffic_history_export_recent || true
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                _error "无效输入，请重试。"
+                ;;
+        esac
+    done
+}
+
+_traffic_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║             流量目录                 ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo -e "  流量监控: ${YELLOW}$(_get_traffic_monitor_status)${NC}"
+        echo -e "  历史记录: ${YELLOW}$(_traffic_history_status_text)${NC}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} 流量监控开关"
+        echo -e "  ${GREEN}[2]${NC} 流量统计查询"
+        echo -e "  ${GREEN}[3]${NC} 流量历史记录"
+        echo -e "  ${GREEN}[4]${NC} 更新脚本"
+        echo -e "  ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        read -p "  请输入选项 [0-4]: " traffic_choice
+
+        case "$traffic_choice" in
+            1) _toggle_traffic_monitoring ;;
+            2) _query_traffic_monitoring ;;
+            3) _traffic_history_menu ;;
+            4) _update_script ;;
+            0) return 0 ;;
+            *) _error "无效输入，请重试。" ;;
+        esac
+    done
 }
 
 _generate_self_signed_cert() {
@@ -5664,10 +6295,16 @@ _main_menu() {
             local xray_nodes=$(jq '.inbounds | length' /usr/local/etc/xray/config.json 2>/dev/null || echo "0")
             xray_status="${xray_status} (${xray_nodes}节点)"
         fi
+
+        local traffic_monitor_status="$(_get_traffic_monitor_status)"
+        local grpcurl_status="${RED}未安装${NC}"
+        [ -x "$GRPCURL_BIN" ] && grpcurl_status="${GREEN}已安装${NC}"
+        local traffic_history_status="$(_traffic_history_status_text)"
         
         echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
         echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}"
         echo -e "  Xray${CYAN}${xray_version}${NC}: ${xray_status}"
+        echo -e "  流量监控: ${CYAN}${traffic_monitor_status}${NC}  |  历史记录: ${CYAN}${traffic_history_status}${NC}  |  grpcurl: ${grpcurl_status}"
         echo ""
         
         # 节点管理
@@ -5688,6 +6325,7 @@ _main_menu() {
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
+        echo -e "    ${GREEN}[19]${NC} 流量目录"
         echo ""
         
         # 核心管理
@@ -5708,7 +6346,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-18]: " choice
+        read -p "  请输入选项 [0-19]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -5724,6 +6362,7 @@ _main_menu() {
             11) _sync_system_time ;;
             12) _require_singbox && _check_config ;;
             13) _update_script ;;
+            19) _require_singbox && _traffic_menu ;;
             14) _install_or_update_singbox ;;
             15) _install_or_update_xray ;;
             16) _uninstall ;; 
@@ -6272,6 +6911,12 @@ while [[ $# -gt 0 ]]; do
             mkdir -p "${SINGBOX_DIR}" 2>/dev/null
             _refresh_dynamic_runtime_limits "all"
             _success "动态资源限制已刷新。"
+            exit 0
+            ;;
+        traffic-history-collect|traffic-history-snapshot)
+            _check_root
+            _detect_init_system
+            _traffic_history_collect_once >/dev/null 2>&1 || true
             exit 0
             ;;
         show-limits)
