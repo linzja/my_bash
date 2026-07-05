@@ -2709,15 +2709,8 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-local",
-        "address": "local",
-        "detour": "direct"
-      }
-    ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-local"
+        "type": "local",
+        "tag": "dns-local"
       }
     ],
     "strategy": "ipv4_only"
@@ -2731,7 +2724,10 @@ _initialize_config_files() {
   ],
   "route": {
     "rules": [],
-    "final": "direct"
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "dns-local"
+    }
   }
 }
 EOF
@@ -2886,8 +2882,8 @@ _cleanup_legacy_config() {
 }
 
 _check_and_fix_dns() {
-    # 热修复：1.补充/收敛 DNS 模块为对方脚本同款 local DNS，2.清除容易引起出站路由绑定死循环的 auto_detect_interface
-    # DNS 目标形态：dns-local / address=local / detour=direct / ipv4_only
+    # 热修复：1.补充/收敛 DNS 模块为新格式 local DNS，2.清除容易引起出站路由绑定死循环的 auto_detect_interface
+    # DNS 目标形态：dns-local / type=local / ipv4_only / default_domain_resolver=dns-local
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
 
     local has_dns has_auto_detect needs_restart=false
@@ -2898,23 +2894,20 @@ _check_and_fix_dns() {
        ! jq -e 'try (
             (.dns.servers | length == 1) and
             (.dns.servers[0].tag == "dns-local") and
-            (.dns.servers[0].address == "local") and
-            (.dns.servers[0].detour == "direct") and
-            (.dns.rules | length == 1) and
-            (.dns.rules[0].outbound == "any") and
-            (.dns.rules[0].server == "dns-local") and
-            (.dns.strategy == "ipv4_only")
+            (.dns.servers[0].type == "local") and
+            (.dns.strategy == "ipv4_only") and
+            (.route.default_domain_resolver.server == "dns-local")
         ) catch false' "$CONFIG_FILE" >/dev/null 2>&1; then
         _warn "检测到配置文件 DNS/路由与当前模板不一致，正在自动修复为 dns-local/local/ipv4_only..."
 
         local tmp_file="${CONFIG_FILE}.tmp"
         jq '.dns = {
                 "servers": [
-                    {"tag": "dns-local", "address": "local", "detour": "direct"}
+                    {"type": "local", "tag": "dns-local"}
                 ],
-                "rules": [{"outbound": "any", "server": "dns-local"}],
                 "strategy": "ipv4_only"
             }
+            | .route = ((.route // {}) + {"default_domain_resolver":{"server":"dns-local"}})
             | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
 
         if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
@@ -2936,6 +2929,11 @@ _check_and_fix_dns() {
 _get_traffic_monitor_status() {
     if [ ! -f "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
         echo "未配置"
+        return 0
+    fi
+
+    if ! _singbox_supports_v2ray_api; then
+        echo "二进制不支持"
         return 0
     fi
 
@@ -3083,6 +3081,38 @@ _singbox_supports_v2ray_api() {
     return 0
 }
 
+_traffic_stats_supported() {
+    _singbox_supports_v2ray_api
+}
+
+_traffic_stats_cleanup_if_unsupported() {
+    TRAFFIC_STATS_CLEANUP_CHANGED=false
+    if _traffic_stats_supported; then
+        return 0
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if jq -e '.experimental.v2ray_api? // empty' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "当前 sing-box 不支持 v2ray_api，正在自动移除流量统计配置。"
+        local tmp_file="${CONFIG_FILE}.tmp"
+        jq 'del(.experimental.v2ray_api)
+            | if (.experimental | type == "object" and length == 0) then del(.experimental) else . end' \
+            "$CONFIG_FILE" > "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ] && mv "$tmp_file" "$CONFIG_FILE" || {
+                rm -f "$tmp_file"
+                return 1
+            }
+        _traffic_history_remove_job || true
+        TRAFFIC_STATS_CLEANUP_CHANGED=true
+        return 0
+    fi
+
+    _traffic_history_remove_job || true
+    return 0
+}
+
 _traffic_show_records() {
     if [ ! -f "$CONFIG_FILE" ]; then
         _error "未找到 sing-box 配置文件。"
@@ -3167,7 +3197,7 @@ _toggle_traffic_monitoring() {
 
         case "$monitor_choice" in
             1)
-                if ! _singbox_supports_v2ray_api; then
+                if ! _traffic_stats_supported; then
                     _error "当前 sing-box 二进制不支持 v2ray_api（缺少 with_v2ray_api 编译标签）。"
                     _warn "请换用带该标签的 sing-box 版本，或先关闭这项流量统计功能。"
                     break
@@ -3243,6 +3273,9 @@ _traffic_history_status_text() {
 }
 
 _traffic_history_schedule_job() {
+    if ! _traffic_stats_supported; then
+        return 1
+    fi
     _ensure_cron_available || return 1
     _install_cli_shortcut || return 1
     _traffic_history_ensure_storage || return 1
@@ -3628,19 +3661,20 @@ _show_node_link() {
     fi
 
     shift 5
+    local flow="${5:-xtls-rprx-vision}"
     
     local url=""
     
     case "$type" in
         "vless-reality")
             # 参数: uuid, sni, public_key, short_id, flow
-            local uuid="$1" pk="$3" sid="$4" flow="${5:-xtls-rprx-vision}"
+            local uuid="$1" pk="$3" sid="$4"
             # 对 SNI 执行终极保底与净化
             local sni=$(echo "$2" | xargs)
             [[ -z "$sni" ]] && sni="$DEFAULT_SNI"
             
             url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=firefox&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
-            _show_mihomo_vless_reality "$name" "$server_ip_raw" "$port" "$uuid" "$sni" "$pk" "$sid" "$flow"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$uuid" "$sni" "$pk" "$sid" "$flow"
             ;;
         "vless-ws-tls")
             # 参数: uuid, sni, ws_path, skip_verify
@@ -3648,11 +3682,19 @@ _show_node_link() {
             local insecure_param=""
             [[ "$skip_verify" == "true" ]] && insecure_param="&insecure=1&allowInsecure=1"
             url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$uuid" "$sni" "$ws_path" "$skip_verify"
             ;;
         "vless-tcp")
             # 参数: uuid
             local uuid="$1"
             url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$uuid"
+            ;;
+        "vless-tcp-tls")
+            # 参数: uuid, sni
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}"
+            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sni}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$uuid" "$sni"
             ;;
         "trojan-ws-tls")
             # 参数: password, sni, ws_path, skip_verify
@@ -3660,6 +3702,13 @@ _show_node_link() {
             local insecure_param=""
             [[ "$skip_verify" == "true" ]] && insecure_param="&insecure=1&allowInsecure=1"
             url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$password" "$sni" "$ws_path" "$skip_verify"
+            ;;
+        "trojan-tcp")
+            # 参数: password, sni
+            local password="$1" sni="${2:-$DEFAULT_SNI}"
+            url="trojan://${password}@${link_ip}:${port}?security=tls&type=tcp&sni=${sni}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$password" "$sni"
             ;;
         "hysteria2")
             # 参数: password, sni, obfs_password(可选), port_hopping(可选)
@@ -3667,11 +3716,13 @@ _show_node_link() {
             local obfs_param=""; [[ -n "$obfs_password" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${obfs_password}")"
             local hop_param=""; [[ -n "$port_hopping" ]] && hop_param="&mport=${port_hopping}&ports=${port_hopping}"
             url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$password" "$sni" "$obfs_password" "$port_hopping"
             ;;
         "tuic")
             # 参数: uuid, password, sni
             local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}"
             url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$uuid" "$password" "$sni"
             ;;
         "anytls")
             # 参数: password, sni, skip_verify
@@ -3681,49 +3732,39 @@ _show_node_link() {
                 insecure_param="&insecure=1&allowInsecure=1"
             fi
             url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$password" "$sni" "$skip_verify"
             ;;
         "shadowsocks")
             # 参数: method, password
             local method="$1" password="$2"
             local userinfo=$(echo -n "${method}:${password}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
             url="ss://${userinfo}@${link_ip}:${port}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$method" "$password"
             ;;
         "shadowsocks-shadowtls")
             # 参数: method, pw, spw, sni
             local method="$1" pw="$2" spw="$3" sni="$4"
             url=""
-            echo -e "${YELLOW}====== [客户端配置参考片段 (Clash Meta / Mihomo)] ======${NC}"
-            echo -e "  - name: \"${name}\""
-            echo -e "    type: ss"
-            echo -e "    server: ${link_ip}"
-            echo -e "    port: ${port}"
-            echo -e "    cipher: ${method}"
-            echo -e "    password: ${pw}"
-            echo -e "    plugin: shadow-tls"
-            echo -e "    plugin-opts:"
-            echo -e "      host: ${sni}"
-            echo -e "      password: ${spw}"
-            echo -e "      version: 3"
-            echo -e "${YELLOW}========================================================${NC}"
-            echo -e "${CYAN}[提示] ShadowTLS 需要特定的客户端配置。${NC}"
-            echo -e "${CYAN}您也可以直接打开本机位于 ${YELLOW}/usr/local/etc/sing-box/clash.yaml${CYAN} 的配置文件，${NC}"
-            echo -e "${CYAN}找到对应节点的 YAML 代码块，并复制到您的客户端中使用！${NC}"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$method" "$pw" "$spw" "$sni"
             ;;
         "vless-ws")
             # Argo 专用: uuid, path
             local uuid="$1" ws_path="$2"
             url="vless://${uuid}@${link_ip}:443?encryption=none&security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ws_path")&sni=${link_ip}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "443" "$uuid" "$ws_path"
             ;;
         "trojan-ws")
             # Argo 专用: password, path
             local password="$1" ws_path="$2"
             url="trojan://$(_url_encode "${password}")@${link_ip}:443?security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ws_path")&sni=${link_ip}#$(_url_encode "$name")"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "443" "$password" "$ws_path"
             ;;
         "socks")
             # 参数: username, password
             local username="$1" password="$2"
             echo ""
             _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
+            _show_mihomo_node "$type" "$name" "$server_ip_raw" "$port" "$username" "$password"
             return
             ;;
     esac
@@ -3743,6 +3784,273 @@ _show_node_link() {
             fi
         fi
     fi
+}
+
+_show_mihomo_node() {
+    local type="$1"
+    local name="$2"
+    local server="$3"
+    local port="$4"
+    shift 4
+
+    case "$type" in
+        "vless-reality")
+            _show_mihomo_vless_reality "$name" "$server" "$port" "$1" "$2" "$3" "$4" "$5"
+            ;;
+        "vless-ws-tls")
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}" ws_path="${3:-/}" skip_verify="${4:-false}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: vless
+  server: ${server}
+  port: ${port}
+  uuid: ${uuid}
+  network: ws
+  tls: true
+  udp: true
+  servername: ${sni}
+  skip-cert-verify: ${skip_verify}
+  ws-opts:
+    path: ${ws_path}
+    headers:
+      Host: ${sni}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "vless-tcp")
+            local uuid="$1"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: vless
+  server: ${server}
+  port: ${port}
+  uuid: ${uuid}
+  network: tcp
+  tls: false
+  udp: true
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "vless-tcp-tls")
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: vless
+  server: ${server}
+  port: ${port}
+  uuid: ${uuid}
+  network: tcp
+  tls: true
+  udp: true
+  servername: ${sni}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "trojan-ws-tls")
+            local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="${3:-/}" skip_verify="${4:-false}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: trojan
+  server: ${server}
+  port: ${port}
+  password: ${password}
+  network: ws
+  tls: true
+  udp: true
+  servername: ${sni}
+  skip-cert-verify: ${skip_verify}
+  ws-opts:
+    path: ${ws_path}
+    headers:
+      Host: ${sni}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "trojan-tcp")
+            local password="$1" sni="${2:-$DEFAULT_SNI}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: trojan
+  server: ${server}
+  port: ${port}
+  password: ${password}
+  network: tcp
+  tls: true
+  udp: true
+  servername: ${sni}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "hysteria2")
+            local password="$1" sni="${2:-$DEFAULT_SNI}" obfs_password="${3:-}" port_hopping="${4:-}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: hysteria2
+  server: ${server}
+  port: ${port}
+  password: ${password}
+  sni: ${sni}
+  skip-cert-verify: true
+  alpn:
+    - h3
+EOF
+            if [ -n "$obfs_password" ]; then
+                cat <<EOF
+  obfs: salamander
+  obfs-password: ${obfs_password}
+EOF
+            fi
+            if [ -n "$port_hopping" ]; then
+                echo "  ports: ${port_hopping}"
+            fi
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "tuic")
+            local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: tuic
+  server: ${server}
+  port: ${port}
+  uuid: ${uuid}
+  password: ${password}
+  alpn:
+    - h3
+  sni: ${sni}
+  skip-cert-verify: true
+  udp-relay-mode: native
+  congestion-controller: bbr
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "anytls")
+            local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="${3:-false}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: anytls
+  server: ${server}
+  port: ${port}
+  password: ${password}
+  client-fingerprint: firefox
+  udp: true
+  idle-session-check-interval: 30
+  idle-session-timeout: 30
+  min-idle-session: 0
+  sni: ${sni}
+  alpn:
+    - h2
+    - http/1.1
+  skip-cert-verify: ${skip_verify}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "shadowsocks")
+            local method="$1" password="$2"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: ss
+  server: ${server}
+  port: ${port}
+  cipher: ${method}
+  password: ${password}
+  udp: true
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "shadowsocks-shadowtls")
+            local method="$1" pw="$2" spw="$3" sni="$4"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: ss
+  server: ${server}
+  port: ${port}
+  cipher: ${method}
+  password: ${pw}
+  plugin: shadow-tls
+  plugin-opts:
+    host: ${sni}
+    password: ${spw}
+    version: 3
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "vless-ws")
+            local uuid="$1" ws_path="${2:-/}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: vless
+  server: ${server}
+  port: ${port}
+  uuid: ${uuid}
+  network: ws
+  tls: true
+  udp: true
+  servername: ${server}
+  ws-opts:
+    path: ${ws_path}
+    headers:
+      Host: ${server}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "trojan-ws")
+            local password="$1" ws_path="${2:-/}"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: trojan
+  server: ${server}
+  port: ${port}
+  password: ${password}
+  network: ws
+  tls: true
+  udp: true
+  servername: ${server}
+  ws-opts:
+    path: ${ws_path}
+    headers:
+      Host: ${server}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+        "socks")
+            local username="$1" password="$2"
+            echo ""
+            echo -e "${YELLOW}════════════════ Mihomo 订阅格式 ════════════════${NC}"
+            cat <<EOF
+- name: ${name}
+  type: socks5
+  server: ${server}
+  port: ${port}
+  username: ${username}
+  password: ${password}
+EOF
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+            ;;
+    esac
 }
 
 _show_mihomo_vless_reality() {
@@ -4984,10 +5292,8 @@ _view_nodes() {
             url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
         fi
         
-        if [ -n "$url" ] && [ "$url" != "null" ]; then
-            : # 直接使用持久化链接
-        else
-            case "$type" in
+        local cached_url="$url"
+        case "$type" in
             "vless")
                 # [资源优化] 合并4次jq为1次
                 local _vless_fields
@@ -5005,11 +5311,13 @@ _view_nodes() {
                     local sn="$tls_sn"
                     local fp="firefox"
                     url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=${fp}&type=tcp&flow=${flow}&sni=${sn}&sid=${sid}#$(_url_encode "$display_name")"
+                    _show_mihomo_node "vless-reality" "$display_name" "$display_ip" "$port" "$uuid" "$sn" "$pk" "$sid" "$flow"
                 elif [ "$transport_type" == "ws" ]; then
                     # ws_path 已在上方合并提取
                     local sn="$tls_sn"
                     [ -z "$sn" ] || [ "$sn" == "null" ] && sn=$(_get_proxy_field "$proxy_name_to_find" ".servername")
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
+                    _show_mihomo_node "vless-ws-tls" "$display_name" "$display_ip" "$port" "$uuid" "$sn" "$ws_path" "false"
                     
                     # Argo 节点元数据已迁移到 argo_metadata.json
                     local argo_domain=""
@@ -5018,12 +5326,15 @@ _view_nodes() {
                     fi
                     if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
                         url="vless://${uuid}@${argo_domain}:443?security=tls&encryption=none&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                        _show_mihomo_node "vless-ws-tls" "$display_name" "$argo_domain" "443" "$uuid" "$argo_domain" "$ws_path" "false"
                     fi
                 elif [ "$tls_enabled" == "true" ]; then
                     local sn="$tls_sn"
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
+                    _show_mihomo_node "vless-tcp-tls" "$display_name" "$display_ip" "$port" "$uuid" "$sn"
                 else
                     url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$display_name")"
+                    _show_mihomo_node "vless-tcp" "$display_name" "$display_ip" "$port" "$uuid"
                 fi
                 ;;
             "trojan")
@@ -5036,6 +5347,7 @@ _view_nodes() {
                 if [ "$transport_type" == "ws" ]; then
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                     url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
+                    _show_mihomo_node "trojan-ws-tls" "$display_name" "$display_ip" "$port" "$password" "$sn" "$ws_path" "false"
                     
                     # Argo 节点元数据已迁移到 argo_metadata.json
                     local argo_domain=""
@@ -5044,10 +5356,12 @@ _view_nodes() {
                     fi
                     if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
                         url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                        _show_mihomo_node "trojan-ws-tls" "$display_name" "$argo_domain" "443" "$password" "$argo_domain" "$ws_path" "false"
                     fi
                 else
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                     url="trojan://${password}@${link_ip}:${port}?security=tls&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
+                    _show_mihomo_node "trojan-tcp" "$display_name" "$display_ip" "$port" "$password" "$sn"
                 fi
                 ;;
             "hysteria2")
@@ -5061,6 +5375,7 @@ _view_nodes() {
                 # 端口跳跃参数
                 local hop_param=""; [[ -n "$hop" && "$hop" != "null" ]] && hop_param="&mport=${hop}&ports=${hop}"
                 url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
+                _show_mihomo_node "hysteria2" "$display_name" "$display_ip" "$port" "$pw" "$sn" "$op" "$hop"
                 ;;
             "tuic")
                 # [资源优化] 合并2次jq为1次
@@ -5068,6 +5383,7 @@ _view_nodes() {
                 IFS=$'\t' read -r uuid pw <<< "$(echo "$node" | jq -r '[.users[0].uuid, .users[0].password] | @tsv')"
                 local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                 url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
+                _show_mihomo_node "tuic" "$display_name" "$display_ip" "$port" "$uuid" "$pw" "$sn"
                 ;;
             "anytls")
                 # [资源优化] 合并2次jq为1次
@@ -5080,20 +5396,25 @@ _view_nodes() {
                     insecure_param="&insecure=1&allowInsecure=1"
                 fi
                 url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
+                _show_mihomo_node "anytls" "$display_name" "$display_ip" "$port" "$pw" "$sn" "$skip_verify"
                 ;;
             "shadowsocks")
                 # [资源优化] 合并2次jq为1次
                 local method password
                 IFS=$'\t' read -r method password <<< "$(echo "$node" | jq -r '[.method, .password] | @tsv')"
                 url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
+                _show_mihomo_node "shadowsocks" "$display_name" "$display_ip" "$port" "$method" "$password"
                 ;;
             "socks")
                 # [资源优化] 合并2次jq为1次
                 local u p
                 IFS=$'\t' read -r u p <<< "$(echo "$node" | jq -r '[.users[0].username, .users[0].password] | @tsv')"
                 _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 用户: $u, 密码: $p"
+                _show_mihomo_node "socks" "$display_name" "$display_ip" "$port" "$u" "$p"
                 ;;
         esac
+        if [ -n "$cached_url" ] && [ "$cached_url" != "null" ]; then
+            url="$cached_url"
         fi
         [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
         # 收集链接到临时文件
@@ -6334,11 +6655,17 @@ _main_menu() {
         local grpcurl_status="${RED}未安装${NC}"
         [ -x "$GRPCURL_BIN" ] && grpcurl_status="${GREEN}已安装${NC}"
         local traffic_history_status="$(_traffic_history_status_text)"
+        local traffic_stats_supported=false
+        if _traffic_stats_supported; then
+            traffic_stats_supported=true
+        fi
         
         echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
         echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}"
         echo -e "  Xray${CYAN}${xray_version}${NC}: ${xray_status}"
-        echo -e "  流量监控: ${CYAN}${traffic_monitor_status}${NC}  |  历史记录: ${CYAN}${traffic_history_status}${NC}  |  grpcurl: ${grpcurl_status}"
+        if [ "$traffic_stats_supported" = true ]; then
+            echo -e "  流量监控: ${CYAN}${traffic_monitor_status}${NC}  |  历史记录: ${CYAN}${traffic_history_status}${NC}  |  grpcurl: ${grpcurl_status}"
+        fi
         echo ""
         
         # 节点管理
@@ -6359,7 +6686,9 @@ _main_menu() {
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
-        echo -e "    ${GREEN}[19]${NC} 流量统计"
+        if [ "$traffic_stats_supported" = true ]; then
+            echo -e "    ${GREEN}[19]${NC} 流量统计"
+        fi
         echo ""
         
         # 核心管理
@@ -6380,7 +6709,11 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-19]: " choice
+        if [ "$traffic_stats_supported" = true ]; then
+            read -p "  请输入选项 [0-19]: " choice
+        else
+            read -p "  请输入选项 [0-18]: " choice
+        fi
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -6396,7 +6729,7 @@ _main_menu() {
             11) _sync_system_time ;;
             12) _require_singbox && _check_config ;;
             13) _update_script ;;
-            19) _require_singbox && _traffic_menu ;;
+            19) if [ "$traffic_stats_supported" = true ]; then _require_singbox && _traffic_menu; else _error "无效输入，请重试。"; fi ;;
             14) _install_or_update_singbox ;;
             15) _install_or_update_xray ;;
             16) _uninstall ;; 
@@ -6862,6 +7195,11 @@ main() {
         
         # 3.3 [热修复] 检测并补充 DNS 模块
         if _check_and_fix_dns; then
+            config_updated=true
+        fi
+
+        # 3.4 [兼容修复] 当前 sing-box 若不支持 v2ray_api，则自动清理流量统计配置
+        if _traffic_stats_cleanup_if_unsupported && [ "$TRAFFIC_STATS_CLEANUP_CHANGED" = true ]; then
             config_updated=true
         fi
         
